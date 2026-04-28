@@ -41,6 +41,8 @@ from typing import Optional
 import pandas as pd
 import requests
 from tqdm import tqdm
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -442,8 +444,6 @@ def csv_to_parquet_chunked(
         return
 
     writer = None
-    import pyarrow as pa
-    import pyarrow.parquet as pq
 
     # Probe actual columns in file to avoid KeyError on missing cols
     header = pd.read_csv(csv_path, nrows=0)
@@ -604,8 +604,6 @@ def assemble_panel(
     For DB1B Coupon (~150 bytes/row) and chunk_size=500_000:
         500_000 × 150 = ~75 MB per chunk — safely under any RAM budget.
     """
-    import pyarrow as pa
-    import pyarrow.parquet as pq
 
     src_dir = processed_dir / dataset
     files = sorted(src_dir.glob("*.parquet"))
@@ -654,8 +652,6 @@ def build_od_market_panel(
     Written in chunks from the panel parquets to stay within 64 GB RAM.
     DB1B Coupon panel may be 10–30 GB; reading in 500K-row batches ≈ 100–300 MB peak.
     """
-    import pyarrow.parquet as pq
-    import pyarrow as pa
 
     coupon_path = output_dir / "db1b_panel.parquet"
     ticket_path = output_dir / "db1b_panel.parquet"  # Ticket assembled separately
