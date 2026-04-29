@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
 """
-download_form41.py — Download BTS Form 41 financial data for structural cost estimation.
+download_form41.py — Download BTS Form 41 financial data.
 
-Form 41 is the DOT's mandatory financial reporting for US air carriers. For
-merger analysis, the most relevant sub-tables are:
+HOW BTS DOWNLOAD WORKS
+-----------------------
+Form 41 data (like T-100) requires a two-step form POST — there are no static
+prezipped files at the URLs used in the original script.
 
-  P-12    Fuel cost and consumption by carrier-month  (Table ID 294)
-  P-1.2   Balance sheet summary                        (Table ID 298)
-  P-7     Operating expenses by carrier-year           (Table ID 41)
-  P-5.2   Income statement                             (Table ID 256)
-  Schedule P-52: Operating expenses by function       (Table ID 297)
+  1. GET  https://www.transtats.bts.gov/DL_SelectFields.aspx?gnoyr_VQ=<ID>
+     to scrape __VIEWSTATE / __VIEWSTATEGENERATOR / __EVENTVALIDATION tokens.
+  2. POST those tokens back with cboYear, cboPeriod=All, field checkboxes
+     → BTS returns a zip containing a CSV.
 
-This script downloads the annual / monthly prezipped CSV files, keeps the
-columns needed for:
-  - Recovering carrier-level marginal cost proxies
-  - Constructing fuel cost instruments (price × distance)
-  - Building cost-function controls for BLP supply side
+Form 41 Schedule Table IDs (gnoyr_VQ codes)
+---------------------------------------------
+  P-12  Fuel Cost & Consumption        FMF
+  P-5.2 Aircraft Operating Expenses    FME  (Group II & III)
+  P-7   Operating Expenses (Func.)     FMG
+  P-1.2 Profit & Loss (Group I+,II,III) FMD
+
+NOTE: Some Form 41 schedules (P-12a, P-1a, B-43) are listed as "restricted
+public" on the DOT data portal and may require a registered BTS account for
+download. The P-12 aggregate fuel cost schedule (gnoyr_VQ=FMF) is publicly
+accessible and covers the key cost-instrument variable (fuel cost per gallon
+by carrier-month). The P-7 and P-5.2 operating expense schedules are also
+publicly downloadable.
 
 Usage
 -----
   python download_form41.py --start-year 2024
-  python download_form41.py --start-year 2018 --end-year 2023
-  python download_form41.py --start-year 2019 --tables p12 p52 --skip-cache
+  python download_form41.py --start-year 2019 --end-year 2023 --tables p12 p52
+  python download_form41.py --start-year 2019 --skip-cache
 
 Arguments
 ---------
@@ -31,13 +40,15 @@ Arguments
   --out-dir    PATH   Parquet output dir. Default: ./parquet/form41
   --raw-dir    PATH   Raw zip dir. Default: ./form41
   --skip-cache FLAG   Force re-download
-  --workers    INT    Parallel threads. Default: 2
+  --workers    INT    Parallel threads. Default: 1
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -48,159 +59,263 @@ import requests
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
-from utils import download_file, extract_zip, get_logger, save_parquet
+from utils import extract_zip, get_logger, mark_cached, save_parquet
 
 # ---------------------------------------------------------------------------
-# BTS Form 41 prezipped file URLs
-# These files are typically released annually with a ~6-month lag.
+# Table definitions: gnoyr_VQ codes confirmed from BTS Fields.asp pages
 # ---------------------------------------------------------------------------
 
-# Table definitions: name → (url_template, table_id, description)
-# URL pattern: https://transtats.bts.gov/PREZIP/Form_41_Schedules_{CODE}_{YEAR}.zip
-# where CODE varies by sub-schedule. We use the stable "prezipped" endpoint.
-
-TABLE_REGISTRY: dict[str, dict] = {
-    # P-12: Fuel Cost and Consumption — MOST IMPORTANT for cost instruments
+TABLE_META = {
+    # P-12: Fuel Cost and Consumption by carrier-month — PRIMARY cost instrument
     "p12": {
-        "url": "https://transtats.bts.gov/PREZIP/Form_41_Schedules_P_12_{year}.zip",
+        "gnoyr_VQ": "FMF",
         "label": "Form41_P12_Fuel",
-        "freq": "annual",   # annual file covering all months
+        "description": "Schedule P-12: Fuel Cost and Consumption",
     },
-    # P-52: Operating Expenses by Functional Category
+    # P-5.2: Aircraft Operating Expenses (Group II & III carriers)
     "p52": {
-        "url": "https://transtats.bts.gov/PREZIP/Form_41_Schedules_P_52_{year}.zip",
-        "label": "Form41_P52_OpEx",
-        "freq": "annual",
+        "gnoyr_VQ": "FME",
+        "label": "Form41_P52_AircraftOpEx",
+        "description": "Schedule P-5.2: Aircraft Operating Expenses",
     },
-    # P-7: Summary of Operations (revenue, expenses, passengers at carrier level)
+    # P-7: Operating Expenses by Functional Grouping
     "p7": {
-        "url": "https://transtats.bts.gov/PREZIP/Form_41_Schedules_P_7_{year}.zip",
-        "label": "Form41_P7_Ops",
-        "freq": "annual",
+        "gnoyr_VQ": "FMG",
+        "label": "Form41_P7_OpExpFunc",
+        "description": "Schedule P-7: Operating Expenses by Function",
     },
-    # P-1.2: Balance Sheet — useful for fixed cost estimation
+    # P-1.2: Profit & Loss Statement (Group I+, II & III)
     "p1": {
-        "url": "https://transtats.bts.gov/PREZIP/Form_41_Schedules_P_1_2_{year}.zip",
-        "label": "Form41_P1_Balance",
-        "freq": "annual",
+        "gnoyr_VQ": "FMD",
+        "label": "Form41_P1_ProfitLoss",
+        "description": "Schedule P-1.2: Profit & Loss Statement",
     },
 }
 
+BASE_URL = "https://www.transtats.bts.gov/DL_SelectFields.aspx?gnoyr_VQ={gnoyr_VQ}&QO_fu146_anzr=Nv4+Pn44vr45"
+
 # ---------------------------------------------------------------------------
-# Column selection per table
+# Columns to retain per schedule
 # ---------------------------------------------------------------------------
 
-P12_COLS = [
-    # Core fuel variables
-    "YEAR",
-    "MONTH",
-    "UNIQUE_CARRIER",
-    "UNIQUE_CARRIER_NAME",
-    "CARRIER_GROUP_NEW",
-    "REGION",
-    # Fuel consumption and cost
-    "TDOMT_COST",       # Total domestic fuel cost ($)
-    "TDOMT_GALLONS",    # Total domestic fuel consumed (gallons)
-    "TDOMT_CPC",        # Cost per gallon domestic
-    "TINT_COST",        # International fuel cost
-    "TINT_GALLONS",
-    "TINT_CPC",
-    # Derived domestic unit cost (computed below)
-    # "TDOMT_CPC" is the key instrument variable
-]
-
-P52_COLS = [
-    "YEAR",
-    "MONTH",
-    "UNIQUE_CARRIER",
-    "UNIQUE_CARRIER_NAME",
-    "CARRIER_GROUP_NEW",
-    "REGION",
-    # Major functional expense categories
-    "OP_REVENUES",
-    "OP_EXPENSES",
-    "LABOR",            # Labor costs (wages + benefits)
-    "MAT",              # Materials (includes fuel in some versions)
-    "LANDING_FEES",     # Airport fees
-    "RENTALS",          # Aircraft/facility rentals
-    "DEPR_AMORT",       # Depreciation
-    "OTHER",
-    "TRANS_EXP",        # Transport-related expenses
-]
-
-P7_COLS = [
-    "YEAR",
-    "MONTH",
-    "UNIQUE_CARRIER",
-    "UNIQUE_CARRIER_NAME",
-    "CARRIER_GROUP_NEW",
-    "REGION",
-    "PASS_REV",         # Passenger revenue
-    "FREIGHT_REV",
-    "OP_EXP",
-    "TOT_REV",
-    "NET_INCOME",
-    "REV_PAX_MILES",    # Revenue passenger miles
-    "AVAIL_SEAT_MILES", # Available seat miles (capacity measure)
-    "PAX_ENPLANED",
-]
-
-P1_COLS = [
-    "YEAR",
-    "MONTH",
-    "UNIQUE_CARRIER",
-    "UNIQUE_CARRIER_NAME",
-    "CARRIER_GROUP_NEW",
-    "ASSETS",
-    "CURR_ASSETS",
-    "LONG_ASSETS",
-    "LIABILITIES",
-    "LONG_DEBT",
-    "NET_WORTH",
-]
-
-TABLE_COLS = {
-    "p12": P12_COLS,
-    "p52": P52_COLS,
-    "p7": P7_COLS,
-    "p1": P1_COLS,
+P12_COLS = {
+    "YEAR", "MONTH", "UNIQUE_CARRIER", "UNIQUE_CARRIER_NAME",
+    "CARRIER_GROUP_NEW", "REGION",
+    # Domestic fuel
+    "TDOMT_COST", "TDOMT_GALLONS", "TDOMT_CPC",
+    # International fuel
+    "TINT_COST", "TINT_GALLONS", "TINT_CPC",
+    # System total
+    "SYSDOMS_COST", "SYSDOMS_GALLONS",
 }
+
+P52_COLS = {
+    "YEAR", "MONTH", "UNIQUE_CARRIER", "UNIQUE_CARRIER_NAME",
+    "CARRIER_GROUP_NEW", "REGION",
+    "FLYING_OPS", "MAINTENANCE", "PAX_SVC", "AIRCRAFT_SVCING",
+    "TRAFFIC_SVCING", "RESERVATIONS", "ADM_GENERAL", "DEPR_AMORT",
+    "TRANSPORT_REL", "TOTAL_OP_EXP",
+}
+
+P7_COLS = {
+    "YEAR", "MONTH", "UNIQUE_CARRIER", "UNIQUE_CARRIER_NAME",
+    "CARRIER_GROUP_NEW", "REGION",
+    "OP_REVENUES", "OP_EXPENSES", "NET_INCOME",
+    "TRANS_REV_PAX", "TRANS_REV_CARGO",
+    "LABOR", "FUEL_OIL", "MATERIALS",
+    "AGENT_FEES", "LANDING_FEES", "RENTALS",
+    "DEPR_AMORT", "OTHER",
+    "PAX_REVENUE_MILES", "AVAIL_SEAT_MILES", "PAX_ENPLANED",
+}
+
+P1_COLS = {
+    "YEAR", "MONTH", "UNIQUE_CARRIER", "UNIQUE_CARRIER_NAME",
+    "CARRIER_GROUP_NEW",
+    "OP_REVENUES", "OP_EXPENSES", "NET_INCOME",
+    "TOT_ASSETS", "TOT_LIABILITIES", "NET_WORTH",
+    "CURR_ASSETS", "LONG_ASSETS", "CURR_LIABILITIES", "LONG_DEBT",
+}
+
+TABLE_COLS = {"p12": P12_COLS, "p52": P52_COLS, "p7": P7_COLS, "p1": P1_COLS}
 
 DTYPE_HINTS = {
-    "YEAR": "int16",
-    "MONTH": "int8",
-    "CARRIER_GROUP_NEW": "int8",
-    # All financial columns → float32 (sufficient precision for $M-scale values)
+    "YEAR": "int16", "MONTH": "int8", "CARRIER_GROUP_NEW": "int8",
 }
 
 logger = get_logger("form41", "form41.log")
 
+# ---------------------------------------------------------------------------
+# ASP.NET token scraper (shared pattern with T-100)
+# ---------------------------------------------------------------------------
+
+_VS_RE  = re.compile(r'id="__VIEWSTATE"\s+value="([^"]*)"')
+_GEN_RE = re.compile(r'id="__VIEWSTATEGENERATOR"\s+value="([^"]*)"')
+_EV_RE  = re.compile(r'id="__EVENTVALIDATION"\s+value="([^"]*)"')
+
+
+def _scrape_tokens(session: requests.Session, url: str) -> dict:
+    resp = session.get(url, timeout=60)
+    resp.raise_for_status()
+    html = resp.text
+
+    def _find(pattern, name):
+        m = pattern.search(html)
+        if not m:
+            raise ValueError(
+                f"Could not find {name} on BTS form page at {url}. "
+                "Check the URL / gnoyr_VQ code is still valid."
+            )
+        return m.group(1)
+
+    return {
+        "__VIEWSTATE":          _find(_VS_RE,  "__VIEWSTATE"),
+        "__VIEWSTATEGENERATOR": _find(_GEN_RE, "__VIEWSTATEGENERATOR"),
+        "__EVENTVALIDATION":    _find(_EV_RE,  "__EVENTVALIDATION"),
+    }
+
+
+def _get_all_field_names(session: requests.Session, url: str) -> list[str]:
+    """
+    Scrape the checkbox input names from the BTS download form.
+    This avoids hardcoding field lists that may change between schedules.
+    """
+    resp = session.get(url, timeout=60)
+    resp.raise_for_status()
+    # Match all checkbox inputs: <input type="checkbox" name="FIELD_NAME" ...>
+    fields = re.findall(
+        r'<input[^>]+type=["\']checkbox["\'][^>]+name=["\']([A-Z0-9_]+)["\']',
+        resp.text, re.IGNORECASE
+    )
+    return list(dict.fromkeys(fields))   # deduplicate, preserve order
+
+
+# ---------------------------------------------------------------------------
+# Core download function
+# ---------------------------------------------------------------------------
 
 def _download_table_year(
     year: int,
     table: str,
     raw_dir: Path,
     out_dir: Path,
-    session: requests.Session,
     skip_cache: bool,
 ) -> Optional[Path]:
-    """Download one (year, table) combination and save as Parquet."""
-    meta = TABLE_REGISTRY[table]
-    url = meta["url"].format(year=year)
-    label = meta["label"]
-    zip_path = raw_dir / f"{label}_{year}.zip"
+    meta         = TABLE_META[table]
+    label        = meta["label"]
+    gnoyr        = meta["gnoyr_VQ"]
+    page_url     = BASE_URL.format(gnoyr_VQ=gnoyr)
+    zip_path     = raw_dir / f"{label}_{year}.zip"
     parquet_path = out_dir / table / f"{year}.parquet"
 
     if parquet_path.exists() and not skip_cache:
         logger.info("SKIP (parquet exists) %s %d", label, year)
         return parquet_path
 
+    # Own session per call (avoids ASP.NET cookie collisions)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    })
+
+    # Step 1 — scrape tokens and field names together in a single GET
+    logger.info("Fetching form for %s %d …", label, year)
     try:
-        download_file(url, zip_path, session=session, logger=logger, skip_cache=skip_cache)
+        tokens = _scrape_tokens(session, page_url)
+        fields = _get_all_field_names(session, page_url)
     except Exception as exc:
-        logger.error("Download failed %s %d: %s", label, year, exc)
+        logger.error("Form scrape failed %s %d: %s", label, year, exc)
         return None
 
+    if not fields:
+        logger.warning(
+            "No checkbox fields found on %s — schedule may require login "
+            "or the gnoyr_VQ code (%s) may have changed.", page_url, gnoyr
+        )
+        # Fall back to a known minimal set so we can still attempt the download
+        fields = ["YEAR", "MONTH", "UNIQUE_CARRIER", "UNIQUE_CARRIER_NAME"]
+
+    # Step 2 — POST
+    post_data: dict = {
+        "__EVENTTARGET":        "",
+        "__EVENTARGUMENT":      "",
+        "__LASTFOCUS":          "",
+        "__VIEWSTATE":          tokens["__VIEWSTATE"],
+        "__VIEWSTATEGENERATOR": tokens["__VIEWSTATEGENERATOR"],
+        "__EVENTVALIDATION":    tokens["__EVENTVALIDATION"],
+        "txtSearch":            "",
+        "cboGeography":         "All",
+        "cboYear":              str(year),
+        "cboPeriod":            "All",
+        "btnDownload":          "Download",
+    }
+    for field in fields:
+        post_data[field] = "on"
+
+    logger.info("Requesting %s %d …", label, year)
+    try:
+        resp = session.post(
+            page_url,
+            data=post_data,
+            headers={
+                "Referer":      page_url,
+                "Origin":       "https://www.transtats.bts.gov",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            stream=True,
+            timeout=300,
+        )
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/html" in content_type:
+            logger.warning(
+                "SKIP %s %d — BTS returned HTML. "
+                "Year may not be available or schedule requires a BTS account.",
+                label, year
+            )
+            return None
+
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        tmp = zip_path.with_suffix(".tmp")
+        total = int(resp.headers.get("content-length", 0)) or None
+        first_bytes = b""
+
+        with open(tmp, "wb") as fh, tqdm(
+            total=total, unit="B", unit_scale=True, unit_divisor=1024,
+            desc=f"  {label} {year}", leave=False,
+        ) as bar:
+            for i, chunk in enumerate(resp.iter_content(chunk_size=1 << 20)):
+                if i == 0:
+                    first_bytes = chunk[:8]
+                fh.write(chunk)
+                bar.update(len(chunk))
+
+        if not first_bytes.startswith(b"PK\x03\x04"):
+            logger.warning(
+                "SKIP %s %d — response is not a ZIP (magic: %s). "
+                "Schedule may require a BTS login. "
+                "Try downloading manually from: %s",
+                label, year, first_bytes[:4].hex(), page_url
+            )
+            tmp.unlink(missing_ok=True)
+            return None
+
+        tmp.rename(zip_path)
+        mark_cached(f"{page_url}|year={year}", zip_path)
+        logger.info("Downloaded %s %d  (%.1f MB)", label, year,
+                    zip_path.stat().st_size / 1e6)
+
+    except Exception as exc:
+        logger.error("POST failed %s %d: %s", label, year, exc)
+        return None
+
+    # Step 3 — extract
     try:
         extracted = extract_zip(zip_path, raw_dir / "extracted", logger=logger)
     except Exception as exc:
@@ -211,62 +326,58 @@ def _download_table_year(
     if not csv_files:
         logger.error("No CSV in %s", zip_path.name)
         return None
-    csv_path = csv_files[0]
 
+    # Step 4 — read + filter columns + save
     desired_cols = TABLE_COLS[table]
-    chunks: list[pd.DataFrame] = []
+    chunks = []
     try:
         reader = pd.read_csv(
-            csv_path,
-            # Use flexible column matching: BTS sometimes adds underscores / caps
-            usecols=lambda c: c.upper().replace(" ", "_") in [d.upper() for d in desired_cols],
+            csv_files[0],
+            usecols=lambda c: c.upper().strip() in desired_cols,
             dtype={k: v for k, v in DTYPE_HINTS.items()},
             chunksize=200_000,
             low_memory=True,
             na_values=["", " ", "N/A"],
         )
-        for chunk in tqdm(reader, desc=f"  Reading {label} {year}", leave=False):
-            # Standardise column names to UPPER_SNAKE
-            chunk.columns = [c.upper().replace(" ", "_") for c in chunk.columns]
+        for chunk in tqdm(reader, desc=f"  Parsing {label} {year}", leave=False):
+            chunk.columns = [c.upper().strip() for c in chunk.columns]
             chunks.append(chunk)
     except Exception as exc:
-        logger.error("Read failed %s: %s", csv_path.name, exc)
+        logger.error("CSV read failed %s %d: %s", label, year, exc)
         return None
 
     if not chunks:
-        logger.warning("Empty file: %s %d", label, year)
+        logger.warning("Empty result %s %d", label, year)
         return None
 
     df = pd.concat(chunks, ignore_index=True)
 
-    # --- Derived variables ---
+    # Derived variables
     if table == "p12":
-        # Fuel cost per gallon (sanity-check: should be ~$2–$5 for domestic jet)
         if "TDOMT_COST" in df.columns and "TDOMT_GALLONS" in df.columns:
-            df["FUEL_COST_PER_GAL"] = (
+            df["FUEL_COST_PER_GAL_DOM"] = (
                 df["TDOMT_COST"] / df["TDOMT_GALLONS"].replace(0, float("nan"))
             ).astype("float32")
-            logger.debug(
-                "%d %s: median fuel $/gal = %.2f",
-                year, label,
-                df["FUEL_COST_PER_GAL"].median()
-            )
+            med = df["FUEL_COST_PER_GAL_DOM"].median()
+            logger.info("%d %s: median domestic $/gal = %.2f", year, label, med)
+            if not (0.5 < med < 10):
+                logger.warning(
+                    "Suspicious fuel price median %.2f for %d — check units.", med, year
+                )
 
     if table == "p7":
-        # Cost per available seat mile (CASM) — key supply-side variable
-        if "OP_EXP" in df.columns and "AVAIL_SEAT_MILES" in df.columns:
+        if "OP_EXPENSES" in df.columns and "AVAIL_SEAT_MILES" in df.columns:
             df["CASM"] = (
-                df["OP_EXP"] / df["AVAIL_SEAT_MILES"].replace(0, float("nan"))
+                df["OP_EXPENSES"] / df["AVAIL_SEAT_MILES"].replace(0, float("nan"))
             ).astype("float32")
 
-    # Downcast float64 columns
     for col in df.select_dtypes("float64").columns:
-        df[col] = pd.to_numeric(df[col], downcast="float")
+        df[col] = df[col].astype("float32")
 
     save_parquet(df, parquet_path, logger=logger)
 
     try:
-        csv_path.unlink()
+        csv_files[0].unlink()
     except OSError:
         pass
 
@@ -274,20 +385,25 @@ def _download_table_year(
     return parquet_path
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     current_year = datetime.now().year
     p = argparse.ArgumentParser(
-        description="Download BTS Form 41 financial data and save as Parquet.",
+        description="Download BTS Form 41 financial data via form POST.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--start-year", type=int, default=2019)
-    p.add_argument("--end-year", type=int, default=current_year)
+    p.add_argument("--end-year",   type=int, default=current_year)
     p.add_argument("--tables", nargs="+", default=["p12", "p52"],
-                   choices=list(TABLE_REGISTRY.keys()) + ["all"])
+                   choices=list(TABLE_META.keys()) + ["all"])
     p.add_argument("--out-dir", type=Path, default=Path("parquet/form41"))
     p.add_argument("--raw-dir", type=Path, default=Path("form41"))
     p.add_argument("--skip-cache", action="store_true")
-    p.add_argument("--workers", type=int, default=2)
+    p.add_argument("--workers", type=int, default=1,
+                   help="Parallel threads (keep at 1 for BTS rate limits)")
     return p.parse_args()
 
 
@@ -295,7 +411,7 @@ def main() -> None:
     args = parse_args()
 
     if "all" in args.tables:
-        args.tables = list(TABLE_REGISTRY.keys())
+        args.tables = list(TABLE_META.keys())
 
     if args.start_year > args.end_year:
         logger.error("--start-year must be ≤ --end-year")
@@ -303,27 +419,21 @@ def main() -> None:
 
     # Form 41 lags ~6 months
     available_end = datetime.now().year - 1
+    end = min(args.end_year, available_end)
 
     tasks = [
         (year, table)
-        for year in range(args.start_year, min(args.end_year, available_end) + 1)
+        for year in range(args.start_year, end + 1)
         for table in args.tables
-        if table in TABLE_REGISTRY
+        if table in TABLE_META
     ]
-
     if not tasks:
-        logger.info("No tasks — nothing to download.")
+        logger.info("No tasks — check year range or table names.")
         return
 
-    logger.info(
-        "Downloading %d Form 41 file(s) — years %d–%d, tables %s",
-        len(tasks), args.start_year, args.end_year, args.tables,
-    )
+    logger.info("Downloading %d Form 41 file(s): years %d–%d, tables %s",
+                len(tasks), args.start_year, end, args.tables)
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; airline-research-bot/1.0)"
-    })
     args.out_dir.mkdir(parents=True, exist_ok=True)
     args.raw_dir.mkdir(parents=True, exist_ok=True)
 
@@ -332,10 +442,9 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             future_map = {
                 executor.submit(
-                    _download_table_year,
-                    year, table,
+                    _download_table_year, year, table,
                     args.raw_dir, args.out_dir,
-                    session, args.skip_cache,
+                    args.skip_cache,
                 ): (year, table)
                 for (year, table) in tasks
             }
@@ -344,13 +453,14 @@ def main() -> None:
                 try:
                     result = future.result()
                     results.append(result)
-                    status = "OK" if result else "FAIL"
+                    status = "OK" if result else "SKIP/FAIL"
                 except Exception as exc:
-                    logger.error("Unhandled error %d %s: %s", yr, tbl, exc)
+                    logger.error("Unhandled %d %s: %s", yr, tbl, exc)
                     results.append(None)
                     status = "ERROR"
                 pbar.set_postfix_str(f"{yr} {tbl} → {status}")
                 pbar.update(1)
+                time.sleep(2)
 
     n_ok = sum(1 for r in results if r is not None)
     logger.info("Done. %d/%d succeeded.", n_ok, len(results))
